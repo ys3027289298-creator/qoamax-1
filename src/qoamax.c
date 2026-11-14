@@ -1677,3 +1677,40 @@ int qoamax_encoder_write_interleaved(qoamax_encoder *restrict self, size_t file_
   *samples += encoded * self->channel_count;
   return 0;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+//                                 Processing                                //
+///////////////////////////////////////////////////////////////////////////////
+
+int32_t qoamax_peak(const int16_t *samples, size_t samples_size) {
+  if (!samples && samples_size) return QOAMAX_ERROR_INVALID_ARGUMENT;
+  int32_t peak = 0;
+  for (size_t i = 0; i < samples_size; i++) {
+    int32_t absolute = samples[i] < 0 ? -(int32_t)samples[i] : samples[i];
+    if (absolute > peak) peak = absolute;
+  }
+  return peak;
+}
+
+int qoamax_normalize(int16_t *samples, size_t samples_size, int32_t target_peak, bool limit, int32_t *out_peak) {
+  if ((!samples && samples_size) || target_peak < 1 || target_peak > INT16_MAX)
+    return QOAMAX_ERROR_INVALID_ARGUMENT;
+
+  int32_t peak  = qoamax_peak(samples, samples_size);
+  int64_t num   = target_peak;      // The gain num / den: target_peak / peak, at most 1 in limiter mode.
+  int64_t den   = peak ? peak : 1;  // Silence (peak 0) stays silence.
+  if (limit && num > den) num = den;
+
+  int32_t resulting_peak = 0;
+  for (size_t i = 0; i < samples_size; i++) {
+    int64_t product = (int64_t)samples[i] * num;
+    // Rounded half away from zero. |samples[i]| <= den and num <= target_peak <= INT16_MAX, so the result
+    // can't exceed target_peak in magnitude (no clipping).
+    int32_t scaled  = (int32_t)((product >= 0 ? product + den / 2 : product - den / 2) / den);
+    samples[i]      = (int16_t)scaled;
+    int32_t absolute = scaled < 0 ? -scaled : scaled;
+    if (absolute > resulting_peak) resulting_peak = absolute;
+  }
+  if (out_peak) *out_peak = resulting_peak;
+  return 0;
+}

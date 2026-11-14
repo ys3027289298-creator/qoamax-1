@@ -70,6 +70,14 @@ static inline void qoamax_encoder_get_error(const qoamax_encoder *self, uint64_t
   for (int i = 0; i < self->channel_count; i++) errors[i] = self->channels[i].error;
 }
 
+////////////////////
+//   Processing   //
+////////////////////
+
+int32_t qoamax_peak(const int16_t *samples, size_t samples_size);
+
+int qoamax_normalize(int16_t *samples, size_t samples_size, int32_t target_peak, bool limit, int32_t *out_peak);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

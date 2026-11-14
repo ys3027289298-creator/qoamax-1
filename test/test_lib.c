@@ -862,6 +862,119 @@ static void test_stack_usage(void) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+//                             Peak normalization                            //
+///////////////////////////////////////////////////////////////////////////////
+
+//! Scales the signal by target/peak by hand (rounded half away from zero), the manual proportional scaling that
+//! qoamax_normalize's output is compared against.
+static void manual_scale(int16_t *samples, size_t count, int32_t target, int32_t peak) {
+  for (size_t i = 0; i < count; i++) {
+    int64_t product = (int64_t)samples[i] * target;
+    samples[i]      = (int16_t)((product >= 0 ? product + peak / 2 : product - peak / 2) / peak);
+  }
+}
+
+//! Returns the largest per-sample difference of the two signals.
+static int32_t max_sample_diff(const int16_t *a, const int16_t *b, size_t count) {
+  int32_t diff = 0;
+  for (size_t i = 0; i < count; i++) {
+    int32_t d = a[i] - b[i];
+    if (d < 0) d = -d;
+    if (d > diff) diff = d;
+  }
+  return diff;
+}
+
+static void test_normalize(void) {
+  // Three clips of uneven loudness made from the test signal's tone section: quiet, medium and hot (clipping).
+  enum { CLIPS = 3, FRAMES = 600 };
+  const char *names[CLIPS] = {"quiet", "medium", "hot"};
+  const int32_t target     = 30000;
+
+  printf("    clip      peak before -> after (target %d) | sample diff | encoded output\n", target);
+  for (int clip = 0; clip < CLIPS; clip++) {
+    int16_t original[FRAMES];
+    for (size_t i = 0; i < FRAMES; i++) {
+      int32_t tone = test_signal(7, 0, i); // the tone section, peak about 16384
+      int32_t sample =
+          clip == 0 ? tone / 8 : clip == 1 ? tone / 2 : tone * 40; // the hot clip is scaled past full scale
+      original[i] = sample < INT16_MIN ? INT16_MIN : sample > INT16_MAX ? INT16_MAX : (int16_t)sample;
+    }
+    int32_t peak_before = qoamax_peak(original, FRAMES);
+
+    // Normalization vs. manual proportional scaling, per sample.
+    int16_t normalized[FRAMES], manual[FRAMES];
+    memcpy(normalized, original, sizeof original);
+    memcpy(manual, original, sizeof original);
+    int32_t peak_after = -1;
+    CHECK(qoamax_normalize(normalized, FRAMES, target, false, &peak_after) == 0, "%s: normalize", names[clip]);
+    manual_scale(manual, FRAMES, target, peak_before);
+    int32_t sample_diff = max_sample_diff(normalized, manual, FRAMES);
+    CHECK(sample_diff == 0, "%s: normalize differs from manual scaling by %d", names[clip], sample_diff);
+
+    // No clipping: the peak after processing never exceeds the target (or full scale).
+    CHECK(peak_after == target, "%s: peak after normalization is %d, expected %d", names[clip], peak_after, target);
+    CHECK(peak_after <= INT16_MAX, "%s: clipping after normalization (peak %d)", names[clip], peak_after);
+    CHECK(qoamax_peak(normalized, FRAMES) == peak_after, "%s: reported peak", names[clip]);
+
+    // The QOA-encoded output of the normalized signal is identical to the manually scaled one.
+    encoded file_normalized = encode_all(QOAMAX_ENCODER_EFFORT_MEDIUM, 1, FRAMES, normalized);
+    encoded file_manual     = encode_all(QOAMAX_ENCODER_EFFORT_MEDIUM, 1, FRAMES, manual);
+    bool encoded_equal = file_normalized.size == file_manual.size &&
+                         memcmp(file_normalized.data, file_manual.data, file_normalized.size) == 0;
+    CHECK(encoded_equal, "%s: the encoded output differs from manual scaling", names[clip]);
+    int16_t *decoded_normalized = decode_all(&file_normalized, 1, FRAMES);
+    int16_t *decoded_manual     = decode_all(&file_manual, 1, FRAMES);
+    int32_t decoded_diff        = max_sample_diff(decoded_normalized, decoded_manual, FRAMES);
+    CHECK(decoded_diff == 0, "%s: the decoded output differs from manual scaling by %d", names[clip], decoded_diff);
+
+    printf("    %-8s %11d -> %-5d %18d | %11d | %s\n", names[clip], peak_before, peak_after, target, sample_diff,
+           encoded_equal ? "identical" : "DIFFERS");
+    free(file_normalized.data), free(file_manual.data), free(decoded_normalized), free(decoded_manual);
+  }
+
+  // Limiter mode: quiet signals pass through unchanged, loud ones are only attenuated to the target.
+  int16_t quiet[FRAMES], hot[FRAMES];
+  for (size_t i = 0; i < FRAMES; i++) {
+    int32_t tone = test_signal(7, 0, i);
+    quiet[i]     = (int16_t)(tone / 8);
+    int32_t loud = tone * 40;
+    hot[i]       = loud < INT16_MIN ? INT16_MIN : loud > INT16_MAX ? INT16_MAX : (int16_t)loud;
+  }
+  int16_t quiet_copy[FRAMES];
+  memcpy(quiet_copy, quiet, sizeof quiet);
+  int32_t peak = -1;
+  CHECK(qoamax_normalize(quiet, FRAMES, target, true, &peak) == 0, "limiter: normalize");
+  CHECK(peak == qoamax_peak(quiet_copy, FRAMES), "limiter: a quiet signal's peak changed to %d", peak);
+  CHECK(memcmp(quiet, quiet_copy, sizeof quiet) == 0, "limiter: a quiet signal was amplified");
+  CHECK(qoamax_normalize(hot, FRAMES, 10000, true, &peak) == 0, "limiter: normalize");
+  CHECK(peak == 10000, "limiter: peak is %d, expected 10000", peak);
+
+  // Silence stays silence (and can't divide by zero).
+  int16_t silence[20] = {0};
+  CHECK(qoamax_normalize(silence, 20, target, false, &peak) == 0, "silence: normalize");
+  CHECK(peak == 0 && qoamax_peak(silence, 20) == 0, "silence: peak is %d", peak);
+
+  // Out-of-range parameters are rejected and leave the samples unchanged.
+  int16_t samples[4] = {100, -200, 300, -400};
+  static const int32_t invalid_targets[] = {0, -1, -32768, 32768, INT32_MAX};
+  for (size_t i = 0; i < sizeof invalid_targets / sizeof invalid_targets[0]; i++) {
+    CHECK(qoamax_normalize(samples, 4, invalid_targets[i], false, NULL) == QOAMAX_ERROR_INVALID_ARGUMENT,
+          "target %d not rejected", invalid_targets[i]);
+    CHECK(qoamax_normalize(samples, 4, invalid_targets[i], true, &peak) == QOAMAX_ERROR_INVALID_ARGUMENT,
+          "target %d not rejected (limiter)", invalid_targets[i]);
+  }
+  CHECK(qoamax_normalize(NULL, 4, target, false, NULL) == QOAMAX_ERROR_INVALID_ARGUMENT, "NULL not rejected");
+  CHECK(qoamax_peak(NULL, 4) == QOAMAX_ERROR_INVALID_ARGUMENT, "qoamax_peak: NULL not rejected");
+  int16_t unchanged[4] = {100, -200, 300, -400};
+  CHECK(memcmp(samples, unchanged, sizeof samples) == 0, "a rejected call modified the samples");
+  // The edge cases of valid calls: the smallest and largest target, no samples, out_peak may be NULL.
+  CHECK(qoamax_normalize(samples, 4, 1, false, NULL) == 0 && qoamax_peak(samples, 4) == 1, "target 1");
+  CHECK(qoamax_normalize(samples, 4, INT16_MAX, false, &peak) == 0 && peak == INT16_MAX, "target 32767");
+  CHECK(qoamax_normalize(NULL, 0, target, false, NULL) == 0, "empty signal");
+}
+
+///////////////////////////////////////////////////////////////////////////////
 //                                    Main                                   //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -881,6 +994,7 @@ int main(int argc, char **argv) {
       {"invalid and corrupt files", test_invalid_files},
       {"stream API", test_stream_api},
       {"stack usage", test_stack_usage},
+      {"peak normalization", test_normalize},
   };
 
 #ifdef QOAMAX_HAS_VARIANTS

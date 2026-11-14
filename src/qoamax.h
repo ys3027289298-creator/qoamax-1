@@ -361,4 +361,31 @@ static inline void qoamax_encoder_get_error(const qoamax_encoder *self,
   for (int i = 0; i < self->channel_count; i++) errors[i] = self->channels[i].error;
 }
 
+////////////////////
+//   Processing   //
+////////////////////
+
+//! Returns the largest absolute sample value (0 to 32768), e.g. to measure a signal's peak before processing.
+//!
+//! @returns the peak, or QOAMAX_ERROR_INVALID_ARGUMENT if samples is NULL while samples_size isn't 0.
+int32_t qoamax_peak(const int16_t *samples, size_t samples_size);
+
+//! Applies the gain that normalizes the signal's peak to target_peak: every sample is scaled by
+//! target_peak / peak, rounded half away from zero (a pure proportional scaling, so encoding the result gives
+//! the same output as scaling the samples by hand).
+//!
+//! The processing never clips: the gain is at most target_peak / peak, so no output sample exceeds target_peak
+//! in magnitude (and a sample of -32768 only stays -32768 when the gain is 1).
+//!
+//! @param samples      The samples to scale in place (all channels of interleaved audio at once).
+//! @param samples_size The number of samples, may be 0.
+//! @param target_peak  The peak to normalize to, 1 to 32767.
+//! @param limit        Limiter mode: only attenuate. A signal quieter than target_peak is passed through
+//!                     unchanged instead of being amplified.
+//! @param out_peak     The peak after the processing is stored here (may be NULL).
+//!
+//! @returns 0 on success, QOAMAX_ERROR_INVALID_ARGUMENT if target_peak is out of range or samples is NULL
+//!          while samples_size isn't 0 (the samples are left unchanged then).
+int qoamax_normalize(int16_t *samples, size_t samples_size, int32_t target_peak, bool limit, int32_t *out_peak);
+
 #endif

@@ -366,7 +366,7 @@ static inline void qoamax_lanes_take_pair(qoamax_vi32 *v, qoamax_vi32 take) {
 //! (20 samples each) of every stream.
 QOAMAX_VARIANT_TARGET
 static void qoamax_encode_ultrafast_lanes(qoamax__stream *restrict streams, int count, int slice_count) {
-  constexpr int lanes = QOAMAX_VARIANT_LANES;
+  enum { lanes = QOAMAX_VARIANT_LANES };
   qoamax_assume(count >= 1 && count <= lanes / 2);
   qoamax_assume(slice_count >= 1);
 
@@ -516,7 +516,7 @@ static void qoamax_encode_ultrafast_lanes(qoamax__stream *restrict streams, int 
 //! lane, with the same results as @ref qoamax_decode_slice.
 QOAMAX_VARIANT_TARGET
 static void qoamax_decode_lanes(qoamax__stream *restrict streams, int count, int slice_count) {
-  constexpr int lanes = QOAMAX_VARIANT_LANES;
+  enum { lanes = QOAMAX_VARIANT_LANES };
   qoamax_assume(count >= 1 && count <= lanes);
 
   // The LMS states by lane (unused lanes are zero). They stay in vectors until the last slice.

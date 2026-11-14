@@ -76,6 +76,9 @@ The API (documented in `src/qoamax.h`, see `test/example.c` for a complete progr
   streams (e.g. the channels of a track) into 64-bit slices (one per 20 samples), and `qoamax_decode_streams`
   decodes them. They encode or decode several streams at once in SIMD lanes, which is much faster than one by one
   (`qoamax_encode_slice` and `qoamax_decode_slice` handle a single slice).
+- **Processing:** `qoamax_normalize` applies the gain that normalizes a signal's peak to a configurable target
+  (with an optional limiter mode that only attenuates, never amplifies) and reports the peak after processing;
+  it never clips. `qoamax_peak` measures a signal's peak.
 
 ```c
 // Encode n samples per channel of interleaved stereo audio into one array of slices per channel...
