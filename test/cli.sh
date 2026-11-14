@@ -167,6 +167,41 @@ expect_same "decode --format=raw" a.pcm a_forced.wav
 expect_ok "decode --format=wav" "$Q" decode -f wav a.qoa a_forced.pcm
 expect_same "decode --format=wav" a.wav a_forced.pcm
 
+#################################################################################
+# Resampling (--resample): arbitrary ratios from 1:256 to 256:1, windowed-sinc filter
+
+# 44100 Hz -> 48000 Hz: 12000 frames become round(12000 * 48000 / 44100) = 13061.
+expect_ok "encode --resample" "$Q" encode -e superfast --resample 48000 in_s16.wav rs48.qoa
+expect_bytes "resampled QOA samplerate" rs48.qoa 9 "00 bb 80" # frame header: 48000 Hz
+expect_ok "decode resampled file" "$Q" decode rs48.qoa rs48.wav
+expect_bytes "resampled WAV samplerate" rs48.wav 24 "80 bb 00 00"     # 48000 Hz
+expect_bytes "resampled WAV data size" rs48.wav 40 "14 cc 00 00"      # 13061 frames * 2 channels * 2 bytes
+expect_ok "decode --resample" "$Q" decode --resample 22050 rs48.qoa rs22.wav
+expect_bytes "decode --resample samplerate" rs22.wav 24 "22 56 00 00" # 22050 Hz
+expect_bytes "decode --resample data size" rs22.wav 40 "c0 5d 00 00"  # 6000 frames * 2 channels * 2 bytes
+
+# Resampling keeps the duration: the resampled file holds the same 12000 / 44100 seconds.
+expect_ok "decode resampled to raw" "$Q" decode rs48.qoa rs48.pcm
+checks=$((checks + 1))
+[ "$(wc -c <rs48.pcm)" -eq $((13061 * 4)) ] || fail "resampled length: $(wc -c <rs48.pcm) bytes"
+
+# Raw input and pipes resample to the same file as WAV input.
+expect_ok "resample raw input" "$Q" encode -e superfast -c 2 -r 44100 --resample 48000 in.pcm rs48raw.qoa
+expect_same "resample raw input" rs48.qoa rs48raw.qoa
+expect_ok "resample from stdin" bash -c "cat in_s16.wav | '$Q' encode -e superfast --resample 48000 - rs48stdin.qoa"
+expect_same "resample from stdin" rs48.qoa rs48stdin.qoa
+
+# The input's own rate is a no-op, and ratios outside 1:256 to 256:1 are rejected.
+expect_ok "resample to the same rate" "$Q" encode --resample 44100 in_s16.wav noop.qoa
+expect_same "resample to the same rate" a.qoa noop.qoa
+expect_error "resample ratio too small" "is not supported" "$Q" encode --resample 100 in_s16.wav small.qoa
+expect_error "resample ratio too large" "is not supported" "$Q" encode --resample 16777215 in_s16.wav large.qoa
+expect_error "decode resample ratio too small" "is not supported" "$Q" decode --resample 100 a.qoa small.wav
+expect_error "invalid resample rate" "invalid samplerate '0'" "$Q" encode --resample 0 in_s16.wav zero.qoa
+expect_missing "resample ratio too small" small.qoa
+expect_missing "resample ratio too large" large.qoa
+expect_missing "decode resample ratio too small" small.wav
+
 if command -v qoaconv >/dev/null; then
   checks=$((checks + 1))
   if qoaconv a.qoa reference.wav >/dev/null 2>&1; then

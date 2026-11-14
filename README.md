@@ -52,6 +52,9 @@ $ qoamax decode output.qoa decoded.wav
 Raw input is used for `.pcm`/`.raw` files, with `--format=raw`, or when `--rate`/`--channels` is given
 (defaults: 48000 Hz, mono).
 `decode` writes 16-bit WAV files, or raw PCM for `.pcm`/`.raw` files and with `--format=raw`.
+Both commands take `--resample=HZ` to convert the samplerate (any ratio from 1:256 to 256:1, using a
+windowed-sinc filter): `encode` stores the audio at the given rate in the QOA file, `decode` outputs it at
+the given rate. Duration and pitch are preserved.
 Use `-` for stdin/stdout to convert other formats with e.g. ffmpeg:
 
 ```sh

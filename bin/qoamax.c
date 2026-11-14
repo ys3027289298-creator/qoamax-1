@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../src/qoamax.c"
+#include "resample.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 //                                 Utilities                                 //
@@ -653,6 +654,10 @@ static void progress_update(progress *self, uint64_t position, uint64_t error, i
 
 //! Samples per channel in the input buffer: a group of ULTRAFAST frames (at least a frame) plus the longest lookahead.
 #define ENCODE_BUFFER_FRAMES (QOAMAX_ULTRAFAST_GROUP_FRAMES * QOAMAX_FRAME_SAMPLES + 80)
+//! Samples per channel read from the input at once when resampling (fed to the resampler in chunks).
+#define RESAMPLE_READ_FRAMES 16384
+//! Frames per channel produced by the resampler at once when decoding.
+#define RESAMPLE_WRITE_FRAMES 32768
 #define ENCODE_STEP_SLICES 32 //!< Slices per channel encoded between progress updates
 //! Output bytes per encoding step: file header, frame header and LMS states, and ENCODE_STEP_SLICES slices.
 #define ENCODE_STEP_SIZE(channels) (8 * (2 + 2 * (channels)) + 8 * (channels) * ENCODE_STEP_SLICES)
@@ -667,11 +672,37 @@ static void progress_update(progress *self, uint64_t position, uint64_t error, i
 //! more, so that it can be refilled before it holds less than that (see decode).
 #define DECODE_INPUT_SIZE (128 * 1024)
 
+//! Reads up to `wanted` frames (per channel) into `samples`, resampling if `rs` is set. Sets `*complete` once the
+//! input is exhausted (and the resampler drained), so that fewer frames are returned only at the end of the audio.
+static size_t read_frames(pcm_reader *reader, resampler *rs, int16_t *samples, size_t wanted, bool *complete) {
+  if (!rs) {
+    size_t read = pcm_reader_read(reader, samples, wanted);
+    *complete   = read < wanted;
+    return read;
+  }
+
+  static int16_t chunk[RESAMPLE_READ_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
+  size_t produced = 0;
+  while (produced < wanted) {
+    produced += resample_pull(rs, &samples[produced * reader->channels], wanted - produced);
+    if (produced == wanted || rs->finished) break;
+    size_t read = pcm_reader_read(reader, chunk, RESAMPLE_READ_FRAMES);
+    if (read > 0 && !resample_push(rs, chunk, read)) {
+      print_error("out of memory");
+      reader->in.failed = true;
+      return 0;
+    }
+    if (read < RESAMPLE_READ_FRAMES) resample_finish(rs); // the input is exhausted (or failed)
+  }
+  *complete = rs->finished && produced < wanted;
+  return produced;
+}
+
 //! Encodes the reader's audio into the output in fixed-size chunks.
 //! @returns the number of encoded samples per channel (0 on errors, which are reported), and their total squared
 //!          error.
 static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort effort, bool show_progress,
-                       const char *title, uint64_t *total_error) {
+                       const char *title, resampler *rs, uint64_t *total_error) {
   static int16_t samples[ENCODE_BUFFER_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
   static char
       encoded[QOAMAX_MAX(ENCODE_STEP_SIZE(QOAMAX_MAX_CHANNEL_COUNT), ULTRAFAST_STEP_SIZE(QOAMAX_MAX_CHANNEL_COUNT))];
@@ -682,15 +713,20 @@ static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort ef
   size_t step_size = ultrafast ? ULTRAFAST_STEP_SIZE(channels) : ENCODE_STEP_SIZE(channels);
   size_t refill_at = ultrafast ? QOAMAX_ULTRAFAST_GROUP_FRAMES * QOAMAX_FRAME_SAMPLES : 0;
 
+  // With --resample, the file gets the target samplerate and the resampled frame count.
+  int32_t out_rate      = rs ? (int32_t)rs->out_rate : reader->samplerate;
+  uint32_t total_frames = reader->frames;
+  if (rs) total_frames = reader->frames != 0 ? (uint32_t)resample_output_frames(rs, reader->frames) : 0;
+
   qoamax_encoder encoder;
-  int err = qoamax_encoder_init(&encoder, effort, channels, reader->frames, reader->samplerate);
+  int err = qoamax_encoder_init(&encoder, effort, channels, total_frames, out_rate);
   if (err) {
     print_error("cannot initialize the encoder: %s", library_error_string(err));
     return 0;
   }
 
   progress display;
-  progress_begin(&display, show_progress, title, reader->frames, reader->samplerate);
+  progress_begin(&display, show_progress, title, total_frames, out_rate);
 
   const int16_t *pos = samples, *end = samples; // the buffered samples
   bool input_complete = false;
@@ -721,12 +757,11 @@ static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort ef
     size_t remaining = end - pos;
     memmove(samples, pos, remaining * sizeof *samples);
     size_t wanted = ENCODE_BUFFER_FRAMES - remaining / channels;
-    size_t read   = pcm_reader_read(reader, &samples[remaining], wanted);
+    size_t read   = read_frames(reader, rs, &samples[remaining], wanted, &input_complete);
     if (reader->in.failed) return 0;
 
     pos            = samples;
     end            = &samples[remaining + read * channels];
-    input_complete = read < wanted;
     buffered += read;
     if (buffered > UINT32_MAX) {
       print_error("the audio is too long (QOA allows at most %lu samples per channel)", (unsigned long)UINT32_MAX);
@@ -769,22 +804,25 @@ static bool qoa_reader_open(qoa_reader *reader, const char *path) {
 
 //! Decodes the QOA input into the output (WAV or raw PCM) in fixed-size chunks.
 //! @returns whether it succeeded (errors are reported), and the number of decoded samples per channel.
-static bool decode(qoa_reader *reader, output *out, pcm_format format, uint64_t *decoded_frames) {
+static bool decode(qoa_reader *reader, output *out, pcm_format format, resampler *rs, uint64_t *decoded_frames) {
   static int16_t samples[DECODE_BUFFER_SAMPLES];
+  static int16_t resampled[RESAMPLE_WRITE_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
   const qoamax_decoder_query *query = &reader->query;
+  int channels                      = query->channel_count;
+  int32_t out_rate                  = rs ? (int32_t)rs->out_rate : query->samplerate;
 
   // The file header's sample count may be 0 (streaming) or wrong. The WAV header is updated at the end if needed.
   unsigned char header[44];
-  uint32_t header_data_size =
-      query->total_samples ? wav_data_size(query->total_samples, query->channel_count) : UINT32_MAX;
-  wav_build_header(header, query->channel_count, query->samplerate, header_data_size);
+  uint64_t expected_frames = query->total_samples;
+  if (rs && expected_frames != 0) expected_frames = resample_output_frames(rs, expected_frames);
+  uint32_t header_data_size = expected_frames ? wav_data_size(expected_frames, channels) : UINT32_MAX;
+  wav_build_header(header, channels, out_rate, header_data_size);
   if (format == FORMAT_WAV) fwrite(header, 1, sizeof header, out->file);
 
   // The library decodes the whole frames that are in the input and fit into the output at once, in parallel (one frame
   // of a channel per SIMD lane). Frames it can't complete, because the input or output ends inside them, are decoded
   // slice by slice (2-3x slower). So the output has room for whole frames only, and the input is refilled while it
   // still holds the frames of a step and one more (it always ends inside a frame).
-  int channels         = query->channel_count;
   size_t step_frames   = QOAMAX_MAX(16 / channels, 1);
   size_t step_samples  = step_frames * QOAMAX_FRAME_SAMPLES * channels;
   size_t frame_size    = 8 * (1 + channels * (2 + QOAMAX_FRAME_SAMPLES / 20));
@@ -814,11 +852,28 @@ static bool decode(qoa_reader *reader, output *out, pcm_format format, uint64_t 
       print_error("cannot decode: %s", library_error_string(err));
       return false;
     }
-    write_s16le(out->file, samples, samples_end - samples);
-    frames += (samples_end - samples) / channels;
 
     // Without progress, the decoder needs more data (or the file ends).
     needs_more_data = reader->pos == pos_before && samples_end == samples;
+
+    if (rs) {
+      // Resample the decoded frames; at the end of the input, flush the resampler completely.
+      if (!resample_push(rs, samples, (size_t)(samples_end - samples) / channels)) {
+        print_error("out of memory");
+        return false;
+      }
+      if (needs_more_data && reader->input_complete) resample_finish(rs);
+      size_t capacity = RESAMPLE_WRITE_FRAMES * QOAMAX_MAX_CHANNEL_COUNT / channels;
+      size_t produced;
+      while ((produced = resample_pull(rs, resampled, capacity)) > 0) {
+        write_s16le(out->file, resampled, produced * channels);
+        frames += produced;
+      }
+    } else {
+      write_s16le(out->file, samples, samples_end - samples);
+      frames += (samples_end - samples) / channels;
+    }
+
     if (needs_more_data && reader->input_complete) break;
   }
 
@@ -828,16 +883,16 @@ static bool decode(qoa_reader *reader, output *out, pcm_format format, uint64_t 
     print_error("cannot decode: the file is truncated or corrupt");
     return false;
   }
-  if (query->total_samples != 0 && query->total_samples != frames)
+  if (expected_frames != 0 && expected_frames != frames)
     print_warning("the file header claims %lu samples per channel, but the frames contain %llu",
-                  (unsigned long)query->total_samples, (unsigned long long)frames);
+                  (unsigned long)(rs ? expected_frames : query->total_samples), (unsigned long long)frames);
 
-  uint32_t data_size = wav_data_size(frames, query->channel_count);
+  uint32_t data_size = wav_data_size(frames, channels);
   if (format == FORMAT_WAV && data_size == UINT32_MAX)
     print_warning("the audio is too long for a WAV header (4 GiB), so it has no size; use --format=raw instead");
   if (format == FORMAT_WAV && data_size != header_data_size) {
     if (out->regular) {
-      wav_build_header(header, query->channel_count, query->samplerate, data_size);
+      wav_build_header(header, channels, out_rate, data_size);
       output_patch(out, 0, header, sizeof header);
     } else if (header_data_size != UINT32_MAX) {
       print_warning("the WAV header's size is wrong, as the output can't be updated afterwards");
@@ -867,6 +922,7 @@ typedef struct {
   pcm_format format;
   long channels;   //!< Raw input only, 0 = default
   long samplerate; //!< Raw input only, 0 = default
+  long resample;   //!< Samplerate to convert to, 0 = keep the input's rate
   bool quiet;
   const char *input;
   const char *output;
@@ -901,12 +957,15 @@ static void print_encode_help(FILE *stream) {
                   "                        .pcm/.raw files and when --rate or --channels is given)\n"
                   "  -r, --rate=HZ         Samplerate of raw input (default: 48000)\n"
                   "  -c, --channels=N      Channel count of raw (interleaved) input (default: 1)\n"
+                  "      --resample=HZ     Resample the audio to HZ before encoding (any ratio\n"
+                  "                        from 1:256 to 256:1, windowed-sinc filter)\n"
                   "  -q, --quiet           Don't show progress and the summary\n"
                   "  -h, --help            Show this help message\n"
                   "\n"
                   "Examples:\n"
                   "  qoamax encode input.wav output.qoa\n"
                   "  qoamax encode --effort=slow input.wav output.qoa\n"
+                  "  qoamax encode --resample=48000 input-44k.wav output.qoa\n"
                   "  qoamax encode -r 44100 -c 2 input.pcm output.qoa\n");
 }
 
@@ -919,6 +978,8 @@ static void print_decode_help(FILE *stream) {
                   "Options:\n"
                   "  -f, --format=FORMAT   Output format: wav or raw (default: raw for\n"
                   "                        .pcm/.raw files, otherwise wav)\n"
+                  "      --resample=HZ     Resample the audio to HZ (any ratio from 1:256\n"
+                  "                        to 256:1, windowed-sinc filter)\n"
                   "  -q, --quiet           Don't show the summary\n"
                   "  -h, --help            Show this help message\n"
                   "\n"
@@ -944,12 +1005,14 @@ static parse_result parse_options(int argc, char **argv, bool encode, options *o
       {"format", required_argument, NULL, 'f'},
       {"rate", required_argument, NULL, 'r'},
       {"channels", required_argument, NULL, 'c'},
+      {"resample", required_argument, NULL, 'R'},
       {"quiet", no_argument, NULL, 'q'},
       {"help", no_argument, NULL, 'h'},
       {NULL, 0, NULL, 0},
   };
   static const struct option decode_options[] = {
       {"format", required_argument, NULL, 'f'},
+      {"resample", required_argument, NULL, 'R'},
       {"quiet", no_argument, NULL, 'q'},
       {"help", no_argument, NULL, 'h'},
       {NULL, 0, NULL, 0},
@@ -989,6 +1052,12 @@ static parse_result parse_options(int argc, char **argv, bool encode, options *o
       break;
     case 'r':
       if (!parse_long(optarg, 1, 0xFFFFFF, &out->samplerate)) {
+        print_error("invalid samplerate '%s' (1 to 16777215)", optarg);
+        return PARSE_EXIT_FAILURE;
+      }
+      break;
+    case 'R':
+      if (!parse_long(optarg, 1, 0xFFFFFF, &out->resample)) {
         print_error("invalid samplerate '%s' (1 to 16777215)", optarg);
         return PARSE_EXIT_FAILURE;
       }
@@ -1051,8 +1120,30 @@ static void print_summary(const char *verb, const char *path, double elapsed, ui
 static int run_encode(const options *opts) {
   pcm_reader reader;
   output out;
-  if (!pcm_reader_open(&reader, opts->input, opts->format, opts->channels, opts->samplerate) ||
-      !output_open(&out, opts->output)) {
+  if (!pcm_reader_open(&reader, opts->input, opts->format, opts->channels, opts->samplerate)) return EXIT_FAILURE;
+
+  // Set up resampling to the --resample rate, if given and different from the input's rate.
+  resampler rs;
+  resampler *resampler_p = NULL;
+  int32_t out_rate       = reader.samplerate;
+  if (opts->resample != 0 && opts->resample != reader.samplerate) {
+    if (!resample_init(&rs, reader.channels, reader.samplerate, (uint32_t)opts->resample)) {
+      print_error("a resample ratio of %d:%ld is not supported (the ratio must be between 1:%d and %d:1)",
+                  reader.samplerate, opts->resample, RESAMPLE_MAX_RATIO, RESAMPLE_MAX_RATIO);
+      input_close(&reader.in);
+      return EXIT_FAILURE;
+    }
+    if (reader.frames != 0 && resample_output_frames(&rs, reader.frames) > UINT32_MAX) {
+      print_error("the resampled audio is too long (QOA allows at most %lu samples per channel)",
+                  (unsigned long)UINT32_MAX);
+      input_close(&reader.in);
+      return EXIT_FAILURE;
+    }
+    resampler_p = &rs;
+    out_rate    = (int32_t)opts->resample;
+  }
+
+  if (!output_open(&out, opts->output)) {
     input_close(&reader.in);
     return EXIT_FAILURE;
   }
@@ -1061,21 +1152,30 @@ static int run_encode(const options *opts) {
   char title[1024], duration[24] = "unknown length";
   if (reader.frames > 0) format_duration(duration, (double)reader.frames / reader.samplerate, true);
   bool colors = terminal.color;
-  snprintf(title, sizeof title, "%sEncoding %s%s%s (%d channels, %d Hz, %s, effort %s)", colors ? "\033[0;37m" : "",
-           colors ? "\033[0;95m" : "", display_name(opts->input), colors ? "\033[0m" : "", reader.channels,
-           reader.samplerate, duration, opts->effort_name);
+  char rate_text[64];
+  if (resampler_p)
+    snprintf(rate_text, sizeof rate_text, "%d → %d Hz", reader.samplerate, out_rate);
+  else
+    snprintf(rate_text, sizeof rate_text, "%d Hz", reader.samplerate);
+  snprintf(title, sizeof title, "%sEncoding %s%s%s (%d channels, %s, %s, effort %s)", colors ? "\033[0;37m" : "",
+           colors ? "\033[0;95m" : "", display_name(opts->input), colors ? "\033[0m" : "", reader.channels, rate_text,
+           duration, opts->effort_name);
 
   uint64_t error  = 0;
   double start    = now_seconds();
-  uint64_t frames = encode(&reader, &out, opts->effort, !opts->quiet && terminal.interactive, title, &error);
+  uint64_t frames = encode(&reader, &out, opts->effort, !opts->quiet && terminal.interactive, title, resampler_p,
+                           &error);
   progress_end();
   bool ok = frames > 0 && !reader.in.failed && !ferror(out.file);
-  if (ok && frames != reader.frames) {
+  // The frame count the file header should claim: the input's count, resampled if --resample is given.
+  uint64_t expected_frames = reader.frames;
+  if (resampler_p) expected_frames = reader.frames != 0 ? resample_output_frames(resampler_p, reader.frames) : 0;
+  if (ok && frames != expected_frames) {
     // The input's length wasn't known (or was wrong), so the file header needs the actual sample count.
     if (out.regular) {
       unsigned char count[4] = {frames >> 24, frames >> 16, frames >> 8, frames};
       output_patch(&out, 4, count, sizeof count);
-    } else if (reader.frames == 0) {
+    } else if (expected_frames == 0) {
       print_warning("the QOA header has no sample count (streaming mode), as the output can't be updated "
                     "afterwards; some decoders don't support this");
     } else {
@@ -1083,13 +1183,15 @@ static int run_encode(const options *opts) {
     }
   }
   input_close(&reader.in);
+  if (resampler_p) resample_free(resampler_p);
   if (!output_close(&out, ok)) return EXIT_FAILURE;
 
   if (!opts->quiet) {
-    char psnr_text[24], details[64];
+    char psnr_text[24], details[96];
     format_psnr(psnr_text, error, frames * reader.channels);
-    snprintf(details, sizeof details, ", PSNR %s, effort %s", psnr_text, opts->effort_name);
-    print_summary("Encoded", opts->input, now_seconds() - start, frames, reader.samplerate, details);
+    snprintf(details, sizeof details, ", PSNR %s, effort %s%s", psnr_text, opts->effort_name,
+             resampler_p ? ", resampled" : "");
+    print_summary("Encoded", opts->input, now_seconds() - start, frames, out_rate, details);
   }
   return EXIT_SUCCESS;
 }
@@ -1101,23 +1203,41 @@ static int run_decode(const options *opts) {
 
   qoa_reader reader;
   output out;
-  if (!qoa_reader_open(&reader, opts->input) || !output_open(&out, opts->output)) {
+  if (!qoa_reader_open(&reader, opts->input)) return EXIT_FAILURE;
+
+  // Set up resampling to the --resample rate, if given and different from the file's rate.
+  resampler rs;
+  resampler *resampler_p = NULL;
+  int32_t out_rate       = reader.query.samplerate;
+  if (opts->resample != 0 && opts->resample != reader.query.samplerate) {
+    if (!resample_init(&rs, reader.query.channel_count, reader.query.samplerate, (uint32_t)opts->resample)) {
+      print_error("a resample ratio of %d:%ld is not supported (the ratio must be between 1:%d and %d:1)",
+                  reader.query.samplerate, opts->resample, RESAMPLE_MAX_RATIO, RESAMPLE_MAX_RATIO);
+      input_close(&reader.in);
+      return EXIT_FAILURE;
+    }
+    resampler_p = &rs;
+    out_rate    = (int32_t)opts->resample;
+  }
+
+  if (!output_open(&out, opts->output)) {
     input_close(&reader.in);
     return EXIT_FAILURE;
   }
 
   uint64_t frames = 0;
   double start    = now_seconds();
-  bool ok         = decode(&reader, &out, format, &frames);
+  bool ok         = decode(&reader, &out, format, resampler_p, &frames);
   input_close(&reader.in);
+  if (resampler_p) resample_free(resampler_p);
   if (!output_close(&out, ok)) return EXIT_FAILURE;
 
   if (!opts->quiet) {
-    char duration[24], details[96];
-    format_duration(duration, (double)frames / reader.query.samplerate, true);
-    snprintf(details, sizeof details, ", %s, %d channels, %d Hz", duration, reader.query.channel_count,
-             reader.query.samplerate);
-    print_summary("Decoded", opts->input, now_seconds() - start, frames, reader.query.samplerate, details);
+    char duration[24], details[128];
+    format_duration(duration, (double)frames / out_rate, true);
+    snprintf(details, sizeof details, ", %s, %d channels, %d Hz%s", duration, reader.query.channel_count, out_rate,
+             resampler_p ? " (resampled)" : "");
+    print_summary("Decoded", opts->input, now_seconds() - start, frames, out_rate, details);
   }
   return EXIT_SUCCESS;
 }

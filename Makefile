@@ -69,10 +69,10 @@ test-build-systems:
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/qoamax-debug: bin/qoamax.c $(LIB_SOURCES) | $(BUILD_DIR)
+$(BUILD_DIR)/qoamax-debug: bin/qoamax.c bin/resample.h $(LIB_SOURCES) | $(BUILD_DIR)
 	$(CC) $(DEBUG_CFLAGS) bin/qoamax.c -o $@ -lm
 
-$(BUILD_DIR)/qoamax: bin/qoamax.c $(LIB_SOURCES) | $(BUILD_DIR)
+$(BUILD_DIR)/qoamax: bin/qoamax.c bin/resample.h $(LIB_SOURCES) | $(BUILD_DIR)
 	$(CC) $(RELEASE_CFLAGS) bin/qoamax.c -o $@ -lm
 
 $(BUILD_DIR)/libqoamax.o: $(LIB_SOURCES) | $(BUILD_DIR)
